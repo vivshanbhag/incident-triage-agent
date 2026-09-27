@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Read-only incident triage reference implementation with an AWS adapter.
+
+Parameters:
+  BedrockModelArn:
+    Type: String
+    Description: ARN of a Bedrock foundation model or inference profile that supports Converse tool use in this region.
+  LogGroupName:
+    Type: String
+    Description: One existing CloudWatch log group the responder may search. Use a sanitized, non-production group for initial evaluation.
+  QueueMaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of failed receives before the event is sent to the dead-letter queue.
+
+Resources:
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: IncidentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: IncidentId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Incident Triage Agent
+
+  IncidentDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  IncidentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IncidentDeadLetterQueue.Arn
+        maxReceiveCount: !Ref QueueMaxReceiveCount
+
+  AlarmStateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Route CloudWatch alarm transitions to ALARM to the triage queue.
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+      State: ENABLED
+      Targets:
+        - Id: IncidentQueueTarget
+          Arn: !GetAtt IncidentQueue.Arn
+
+  EventBridgeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IncidentQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowMatchingEventBridgeRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IncidentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AlarmStateRule.Arn
+
+  ResponderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 512
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ARN: !Ref BedrockModelArn
+          ALLOWED_LOG_GROUP: !Ref LogGroupName
+          INCIDENT_TABLE: !Ref IncidentTable
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+      Policies:
+        - Statement:
+            - Sid: InvokeConfiguredBedrockModel
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Ref BedrockModelArn
+            - Sid: ReadAlarmDiagnostics
+              Effect: Allow
+              Action:
+                - cloudwatch:DescribeAlarms
+                - cloudwatch:DescribeAlarmHistory
+              Resource: '*'
+            - Sid: ReadConfiguredLogs
+              Effect: Allow
+              Action:
+                - logs:FilterLogEvents
+              Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+            - Sid: WriteIncidentRecords
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt IncidentTable.Arn
+            - Sid: PublishIncidentBrief
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref NotificationTopic
+      Events:
+        IncidentQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IncidentQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  IncidentTableName:
+    Description: DynamoDB table containing minimal incident metadata and generated briefs.
+    Value: !Ref IncidentTable
+  NotificationTopicArn:
+    Description: Subscribe intended on-call responders to this SNS topic after deployment.
+    Value: !Ref NotificationTopic
+  AlarmQueueUrl:
+    Description: Queue receiving matching CloudWatch alarm events.
+    Value: !Ref IncidentQueue
+  DeadLetterQueueUrl:
+    Description: Queue containing events that failed repeated processing.
+    Value: !Ref IncidentDeadLetterQueue
